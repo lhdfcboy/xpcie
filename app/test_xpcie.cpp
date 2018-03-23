@@ -19,10 +19,9 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <termios.h>
-
 #include <sys/types.h>
 #include <sys/mman.h>
-
+#include <stdlib.h> /*posix_memalign*/
 #include "Thread.h"
 #include "LogUtils.h"
 
@@ -261,6 +260,40 @@ int testXpcieUser()
 	close(fd0);
 }
 
+void test_h2c(void)
+{
+	char* memptr = NULL;
+	size_t alignment = 4096;
+	size_t size = 128;
+	int fd0 = 0;
+
+
+#if 0
+
+	fd0 = open("/dev/" DRV_NAME "_h2c", O_RDWR);
+	if (fd0 < 0)
+	{
+		logError << "open /dev/" DRV_NAME "_user failed";
+		return -1;
+	}
+
+	close(fd0);
+#endif
+	//extra 4096B space is required
+	posix_memalign((void **)&memptr,alignment, size);
+	if (NULL == memptr)
+	{
+		logError << "posix_memalign";
+		return ;
+	}
+
+
+out:
+	if(memptr)
+		free(memptr);
+	
+	return;
+}
 int main (int argc, char** argv)
 {
 	int ret;
@@ -269,7 +302,8 @@ int main (int argc, char** argv)
 	log4cpp::NDC::push(("main    "));
 #endif
 
-	testReg(argc, argv);
+	//testReg(argc, argv);
+	test_h2c();
 
 	return ret;
 }

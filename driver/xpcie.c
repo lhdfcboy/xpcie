@@ -13,10 +13,32 @@
 #include <asm-generic/iomap.h>
 
 
+#include <linux/cdev.h>
+#include <linux/dma-mapping.h>
+#include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+
+#include <asm/byteorder.h>
+#include <asm/cacheflush.h>
+#include <asm/delay.h>
+#include <asm/pci.h>
+
+
+
+
 static struct class *xpcie_class;	/* sys filesystem */
-static struct class_device *xpcie_class_user;	/* sys filesystem */
-static struct class_device *xpcie_class_h2c;	/* sys filesystem */
-static struct class_device *xpcie_class_c2h;	/* sys filesystem */
+static struct device *xpcie_class_user;	/* sys filesystem */
+static struct device *xpcie_class_h2c;	/* sys filesystem */
+static struct device *xpcie_class_c2h;	/* sys filesystem */
 static int major_user;
 static int major_h2c;
 static int major_c2h;
@@ -30,6 +52,355 @@ static const struct pci_device_id pci_ids[] = {
 	{ PCI_DEVICE(0x10ee, 0x7038), },
 	{ 0, }
 };
+
+
+/**
+* Driver module exercising scatterlist interfaces
+*
+* (C) Copyright 2008-2014 Leon Woestenberg  <leon@sidebranch.com>
+*
+*/
+
+//#define DEBUG
+
+
+/*
+* sg_create_mapper() - Create a mapper for virtual memory to scatterlist.
+*
+* @max_len: Maximum number of bytes that can be mapped at a time.
+*
+* Allocates a book keeping structure, array to page pointers and a scatter
+* list to map virtual user memory into.
+*
+*/
+struct sg_mapping_t *sg_create_mapper(unsigned long max_len)
+{
+	struct sg_mapping_t *sgm;
+	if (max_len == 0)
+		return NULL;
+
+	/* 分配自定义的sgm */
+	sgm = kcalloc(1, sizeof(struct sg_mapping_t), GFP_KERNEL);
+	if (sgm == NULL)
+		return NULL;
+	/* 计算页数 */
+	sgm->max_pages = max_len / PAGE_SIZE + 2;
+
+	/* 根据最大页数，分配page数组 */
+	sgm->pages = kcalloc(sgm->max_pages, sizeof(*sgm->pages), GFP_KERNEL);
+	if (sgm->pages == NULL) {
+		kfree(sgm);
+		return NULL;
+	}
+	pr_debug("Allocated %lu bytes for page pointer array for %d pages @0x%p.\n",
+		sgm->max_pages * sizeof(*sgm->pages), sgm->max_pages, sgm->pages);
+
+
+	/* 根据最大页数，分配scatterlist */
+	sgm->sgl = kcalloc(sgm->max_pages, sizeof(struct scatterlist), GFP_KERNEL);
+	if (sgm->sgl == NULL) {
+		kfree(sgm->pages);
+		kfree(sgm);
+		return NULL;
+	}
+	pr_debug("Allocated %lu bytes for scatterlist for %d pages @0x%p.\n",
+		sgm->max_pages * sizeof(struct scatterlist), sgm->max_pages, sgm->sgl);
+
+	/* 根据最大页数，初始化scatterlist */
+	sg_init_table(sgm->sgl, sgm->max_pages);
+
+	pr_debug("sg_mapping_t *sgm=0x%p\n", sgm);
+	pr_debug("sgm->pages=0x%p\n", sgm->pages);
+	return sgm;
+};
+
+/*
+* sg_destroy_mapper() - Destroy a mapper for virtual memory to scatterlist.
+*
+* @sgm scattergather mapper handle.
+*/
+void sg_destroy_mapper(struct sg_mapping_t *sgm)
+{
+	/* user failed to call sgm_unmap_user_pages() */
+	BUG_ON(sgm->mapped_pages > 0);
+	/* free scatterlist */
+	kfree(sgm->sgl);
+	/* free page array */
+	kfree(sgm->pages);
+	/* free mapper handle */
+	kfree(sgm);
+	pr_debug("Freed page pointer and scatterlist.\n");
+};
+
+/*
+* sgm_map_user_pages() - Get user pages and build a scatterlist.
+*
+* @sgm scattergather mapper handle.
+* @start User space buffer (virtual memory) address.
+* @count Number of bytes in buffer.
+* @to_user !0 if data direction is from device to user space.
+*
+* Returns Number of entries in the table on success, -1 on error.
+*/
+int sgm_get_user_pages(struct sg_mapping_t *sgm, const char *start, size_t count, int dir_to_dev)
+{
+	int rc, i;
+	int nr_pages;
+	struct scatterlist *sgl = NULL;
+	struct page **pages = NULL;
+	
+
+	/* calculate page frame number @todo use macro's */
+	const unsigned long first = ((unsigned long)start & PAGE_MASK) >> PAGE_SHIFT;
+	const unsigned long last = (((unsigned long)start + count - 1) & PAGE_MASK) >> PAGE_SHIFT;
+
+	/* the number of pages we want to map in 因为用户空间虚拟地址是线性的，所以能算出页数 */
+	nr_pages = last - first + 1;
+	sgl = sgm->sgl;
+	/* pointer to array of page pointers */
+	pages = sgm->pages;
+
+
+	pr_debug("sgm_map_user_pages() first=%016lX, last=%016lX, nr_pages=%d\n", first, last, nr_pages);
+	pr_debug("sgl = 0x%p.\n", sgl);
+
+#if 0
+	if (start + count < start)
+		return -EINVAL;
+	if (nr_pages > sgm->max_pages)
+		return -EINVAL;
+	if (count == 0)
+		return 0;
+#endif
+
+	/* 初始化和清零 */
+	sg_init_table(sgl, nr_pages);//重复
+	pr_debug("pages=0x%p\n", pages);
+	pr_debug("start = 0x%llx.\n",
+		(unsigned long long)start);
+	pr_debug("first = %lu, last = %lu\n", first, last);
+	for (i = 0; i < nr_pages - 1; i++) {
+		pages[i] = NULL;
+	}
+
+	/* try to fault in all of the necessary pages */
+#if 0
+	down_read(&current->mm->mmap_sem);
+	/* to_user != 0 means read from device, write into user space buffer memory */
+	rc = get_user_pages(current, current->mm, (unsigned long)start, nr_pages, to_user,
+		0 /* don't force */, pages, NULL);
+	pr_debug("get_user_pages(%lu, nr_pages = %d) == %d.\n", (unsigned long)start, nr_pages, rc);
+	up_read(&current->mm->mmap_sem);
+#else
+	rc = get_user_pages_fast((unsigned long)start, nr_pages, !dir_to_dev/*write*/, pages);
+	pr_debug("get_user_pages_fast(%lu, nr_pages = %d) == %d.\n", (unsigned long)start, nr_pages, rc);
+#endif
+
+	for (i = 0; i < nr_pages - 1; i++) {
+		pr_debug("%04d: page=0x%p\n", i, pages[i]);
+	}
+	/* errors and no page mapped should return here */
+	if (rc < nr_pages) {
+		if (rc > 0) sgm->mapped_pages = rc;
+		pr_debug("Could not get_user_pages(), %d.\n", rc);
+		goto out_unmap;
+	}
+	/* XXX */
+	BUG_ON(rc != nr_pages);
+	sgm->mapped_pages = rc;
+	pr_debug("sgm->mapped_pages = %d\n", sgm->mapped_pages);
+
+	for (i = 0; i < nr_pages; i++) {
+		flush_dcache_page(pages[i]);
+	}
+
+	/* populate the scatter/gather list */
+	pr_debug("%04d: page=0x%p\n", 0, (void *)pages[0]);
+
+	sg_set_page(&sgl[0], pages[0], 0 /*length*/, offset_in_page(start));
+	pr_debug("sg_page(&sgl[0]) = 0x%p (pfn = %lu).\n", sg_page(&sgl[0]),
+		page_to_pfn(sg_page(&sgl[0])));
+
+	/* verify if the page start address got into the first sg entry */
+	pr_debug("sg_dma_address(&sgl[0])=0x%016llx.\n", (u64)sg_dma_address(&sgl[0]));
+	pr_debug("sg_dma_len(&sgl[0])=0x%08x.\n", sg_dma_len(&sgl[0]));
+
+	/* multiple pages? */
+	if (nr_pages > 1) {
+		/* offset was already set above */
+		sgl[0].length = PAGE_SIZE - sgl[0].offset;
+		pr_debug("%04d: page=0x%p, pfn=%lu, offset=%u, length=%u (FIRST)\n", 0,
+			(void *)sg_page(&sgl[0]), (unsigned long)page_to_pfn(sg_page(&sgl[0])), sgl[0].offset, sgl[0].length);
+		count -= sgl[0].length;
+		/* iterate over further pages, except the last page */
+		for (i = 1; i < nr_pages - 1; i++) {
+			BUG_ON(count < PAGE_SIZE);
+			/* set the scatter gather entry i */
+			sg_set_page(&sgl[i], pages[i], PAGE_SIZE, 0/*offset*/);
+			count -= PAGE_SIZE;
+			pr_debug("%04d: page=0x%p, pfn=%lu, offset=%u, length=%u\n", i,
+				(void *)sg_page(&sgl[i]), (unsigned long)page_to_pfn(sg_page(&sgl[i])), sgl[i].offset, sgl[i].length);
+		}
+		/* last page */
+		BUG_ON(count > PAGE_SIZE);
+		/* set count bytes at offset 0 in the page */
+		sg_set_page(&sgl[i], pages[i], count, 0);
+		pr_debug("%04d: page=0x%p, pfn=%lu, offset=%u, length=%u (LAST)\n", i,
+			(void *)sg_page(&sgl[i]), (unsigned long)page_to_pfn(sg_page(&sgl[i])), sgl[i].offset, sgl[i].length);
+	}
+	/* single page */
+	else {
+		/* limit the count */
+		sgl[0].length = count;
+		pr_debug("%04d: page=0x%p, pfn=%lu, offset=%u, length=%u (SINGLE/FIRST/LAST)\n", 0,
+			(void *)sg_page(&sgl[i]), (unsigned long)page_to_pfn(sg_page(&sgl[0])), sgl[0].offset, sgl[0].length);
+	}
+	return nr_pages;
+
+out_unmap:
+	/* { rc < 0 means errors, >= 0 means not all pages could be mapped } */
+	/* did we map any pages? */
+	for (i = 0; i < sgm->mapped_pages; i++)
+		put_page(pages[i]);
+	rc = -ENOMEM;
+	sgm->mapped_pages = 0;
+	return rc;
+}
+
+/*
+* sgm_unmap_user_pages() - Mark the pages dirty and release them.
+*
+* Pages mapped earlier with sgm_map_user_pages() are released here.
+* after being marked dirtied by the DMA.
+*
+*/
+int sgm_put_user_pages(struct sg_mapping_t *sgm, int dir_to_dev)
+{
+	int i;
+	/* mark page dirty */
+	if (!dir_to_dev)
+		sgm_dirty_pages(sgm);
+	/* put (i.e. release) pages */
+	for (i = 0; i < sgm->mapped_pages; i++) {
+		put_page(sgm->pages[i]);
+	}
+	/* remember we have zero pages */
+	sgm->mapped_pages = 0;
+	return 0;
+}
+
+void sgm_dirty_pages(struct sg_mapping_t *sgm)
+{
+	int i;
+	/* iterate over all mapped pages */
+	for (i = 0; i < sgm->mapped_pages; i++) {
+		/* mark page dirty */
+		SetPageDirty(sgm->pages[i]);
+	}
+}
+
+/* sgm_kernel_pages() -- create a sgm map from a vmalloc()ed memory */
+int sgm_kernel_pages(struct sg_mapping_t *sgm, const char *start, size_t count, int to_user)
+{
+	/* calculate page frame number @todo use macro's */
+	const unsigned long first = ((unsigned long)start & PAGE_MASK) >> PAGE_SHIFT;
+	const unsigned long last = (((unsigned long)start + count - 1) & PAGE_MASK) >> PAGE_SHIFT;
+
+	/* the number of pages we want to map in */
+	const int nr_pages = last - first + 1;
+	int rc, i;
+	struct scatterlist *sgl = sgm->sgl;
+	/* pointer to array of page pointers */
+	struct page **pages = sgm->pages;
+	unsigned char *virt = (unsigned char *)start;
+
+	pr_debug("sgm_kernel_pages()\n");
+	pr_debug("sgl = 0x%p.\n", sgl);
+
+	/* no pages should currently be mapped */
+	BUG_ON(sgm->mapped_pages > 0);
+	if (start + count < start)
+		return -EINVAL;
+	if (nr_pages > sgm->max_pages)
+		return -EINVAL;
+	if (count == 0)
+		return 0;
+	/* initialize scatter gather list */
+	sg_init_table(sgl, nr_pages);
+
+	pr_debug("pages=0x%p\n", pages);
+	pr_debug("start = 0x%llx.\n",
+		(unsigned long long)start);
+	pr_debug("first = %lu, last = %lu\n", first, last);
+
+	/* get pages belonging to vmalloc()ed space */
+	for (i = 0; i < nr_pages; i++, virt += PAGE_SIZE) {
+		pages[i] = vmalloc_to_page(virt);
+		if (pages[i] == NULL)
+			goto err;
+		/* make sure page was allocated using vmalloc_32() */
+		BUG_ON(PageHighMem(pages[i]));
+	}
+	for (i = 0; i < nr_pages; i++) {
+		pr_debug("%04d: page=0x%p\n", i, pages[i]);
+	}
+	sgm->mapped_pages = nr_pages;
+	pr_debug("sgm->mapped_pages = %d\n", sgm->mapped_pages);
+
+	for (i = 0; i < nr_pages; i++) {
+		flush_dcache_page(pages[i]);
+	}
+
+	/* populate the scatter/gather list */
+	pr_debug("%04d: page=0x%p\n", 0, (void *)pages[0]);
+
+	/* set first page */
+	sg_set_page(&sgl[0], pages[0], 0 /*length*/, offset_in_page(start));
+	pr_debug("sg_page(&sgl[0]) = 0x%p (pfn = %lu).\n", sg_page(&sgl[0]),
+		page_to_pfn(sg_page(&sgl[0])));
+
+	/* verify if the page start address got into the first sg entry */
+	pr_debug("sg_dma_address(&sgl[0])=0x%016llx.\n", (u64)sg_dma_address(&sgl[0]));
+	pr_debug("sg_dma_len(&sgl[0])=0x%08x.\n", sg_dma_len(&sgl[0]));
+
+	/* multiple pages? */
+	if (nr_pages > 1) {
+		/* { sgl[0].offset is already set } */
+		sgl[0].length = PAGE_SIZE - sgl[0].offset;
+		pr_debug("%04d: page=0x%p, pfn=%lu, offset=%u length=%u (F)\n", 0,
+			(void *)sg_page(&sgl[0]), (unsigned long)page_to_pfn(sg_page(&sgl[0])), sgl[0].offset, sgl[0].length);
+		count -= sgl[0].length;
+		/* iterate over further pages, except the last page */
+		for (i = 1; i < nr_pages - 1; i++) {
+			BUG_ON(count < PAGE_SIZE);
+			/* set the scatter gather entry i */
+			sg_set_page(&sgl[i], pages[i], PAGE_SIZE, 0/*offset*/);
+			count -= PAGE_SIZE;
+			pr_debug("%04d: page=0x%p, pfn=%lu, offset=%u length=%u\n", i,
+				(void *)sg_page(&sgl[i]), (unsigned long)page_to_pfn(sg_page(&sgl[i])), sgl[i].offset, sgl[i].length);
+		}
+		/* last page */
+		BUG_ON(count > PAGE_SIZE);
+		/* 'count' bytes remaining at offset 0 in the page */
+		sg_set_page(&sgl[i], pages[i], count, 0);
+		pr_debug("%04d: pfn=%lu, offset=%u length=%u (L)\n", i,
+			(unsigned long)page_to_pfn(sg_page(&sgl[i])), sgl[i].offset, sgl[i].length);
+	}
+	/* single page */
+	else {
+		/* limit the count */
+		sgl[0].length = count;
+		pr_debug("%04d: pfn=%lu, offset=%u length=%u (F)\n", 0,
+			(unsigned long)page_to_pfn(sg_page(&sgl[0])), sgl[0].offset, sgl[0].length);
+	}
+	return nr_pages;
+
+err:
+	rc = -ENOMEM;
+	sgm->mapped_pages = 0;
+	return rc;
+}
+
 
 inline void write_register(u32 value, void *iomem)
 {
@@ -121,7 +492,7 @@ static int request_regions(struct pci_dev *pdev)
 	return rc;
 }
 
-static void engine_start()
+static void engine_start(void)
 {
 	u32 w;
 
@@ -131,7 +502,11 @@ static void engine_start()
 	w |= (u32)XDMA_CTRL_IE_DESC_ERROR;
 	w |= (u32)XDMA_CTRL_IE_DESC_ALIGN_MISMATCH;
 	w |= (u32)XDMA_CTRL_IE_MAGIC_STOPPED;
-	
+
+ 	w |= (u32)XDMA_CTRL_IE_DESC_STOPPED;
+// 	w |= (u32)XDMA_CTRL_IE_DESC_COMPLETED;
+
+
 	/* start the engine */
 	write_register(w, &engine_regs_h2c->control);
 
@@ -139,7 +514,7 @@ static void engine_start()
 	w = read_register(&engine_regs_h2c->status);
 }
 
-static void engine_stop()
+static void engine_stop(void)
 {
 	u32 w;
 
@@ -170,7 +545,7 @@ static int test_h2c(struct pci_dev *pdev)
 		goto out1;
 	}
 	memset(desc_virt, 0, desc_size);
-	dbg_init("pci_alloc_consistent OK, phy=%016X, bus=%016X \n", desc_virt, desc_bus);
+	dbg_init("pci_alloc_consistent OK, phy=%p, bus=%016llX \n", desc_virt, desc_bus);
 
 	/* 分配数据换缓冲区，伪造数据 */
 	data_virt = pci_alloc_consistent(pdev, data_size, &data_bus);
@@ -179,13 +554,13 @@ static int test_h2c(struct pci_dev *pdev)
 		dbg_init("pci_alloc_consistent failed \n");
 		goto out2;
 	}
-	for (i = 0; i<data_size; i++)
+	for (i = 0; i < data_size; i++)
 	{
 		data_virt[i] = i;
 	}
 
 	/* 填充desc */
-	temp_control = DESC_MAGIC | (0x1);
+	temp_control = DESC_MAGIC | (0x13);
 	desc_virt->bytes = data_size;
 	desc_virt->control = cpu_to_le32(temp_control);
 	desc_virt->dst_addr_lo = cpu_to_le32(PCI_DMA_L(ep_addr));
@@ -218,15 +593,47 @@ out2:
 out1:
 	return 0;
 }
-static int test_dma_read_bar(void)
+
+static int transfer_start(struct pci_dev *pdev, struct xdma_transfer* transfer)
 {
 	u32 value;
-	value = read_register(&engine_regs_h2c->identifier);
-	dbg_init("engine_regs_h2c->identifier =  0x%08X\n", value);
+	int extra_adj = 0;
 
-	value = read_register(&sgdma_common_regs->identifier);
-	dbg_init("sgdma_common_regs->identifier =  0x%08X\n", value);
+	value = read_register(&engine_regs_h2c->status);
+	dbg_init("before transfer, engine_regs_h2c->status =  0x%08X\n", value);
+
+	/* 设置extra_adj */
+	if (transfer->desc_adjacent > 0) {
+		extra_adj = transfer->desc_adjacent - 1;
+		if (extra_adj > MAX_EXTRA_ADJ)
+			extra_adj = MAX_EXTRA_ADJ;
+	}
+	dbg_init("iowrite32(0x%08x to engine_sgdma_regs->first_desc_adjacent ) (first_desc_adjacent)\n", extra_adj);
+	write_register(cpu_to_le32(extra_adj), &engine_sgdma_regs->first_desc_adjacent);
+	
+	/* 设置sgdma_regs */
+	dbg_init("transfer->desc_bus =  0x%016llX\n", transfer->desc_bus);
+	dbg_init("transfer->desc_adjacent =  0x%08X\n", transfer->desc_adjacent);
+	write_register(cpu_to_le32(PCI_DMA_L(transfer->desc_bus)), &engine_sgdma_regs->first_desc_lo);
+	write_register(cpu_to_le32(PCI_DMA_H(transfer->desc_bus)), &engine_sgdma_regs->first_desc_hi);
+	
+
+
+	/* 启动引擎 */
+	engine_start();
+
+	/* 等待传输完 */
+	mdelay(2000);
+	value = read_register(&engine_regs_h2c->status);
+	dbg_init("engine_regs_h2c->status =  0x%08X\n", value);
+
+	/* 停止引擎 */
+	engine_stop();
+
+
+	return 0;
 }
+
 static int map_bars(struct pci_dev *pdev)
 {
 	const int USER_BAR_INDEX = 0;
@@ -239,7 +646,6 @@ static int map_bars(struct pci_dev *pdev)
 	engine_regs_c2h = (struct engine_regs *) (bar[DMA_BAR_INDEX] + 1 * TARGET_SPACING);
 	engine_sgdma_regs = (struct engine_sgdma_regs *) (bar[DMA_BAR_INDEX] + 4 * TARGET_SPACING);
 	sgdma_common_regs = (struct sgdma_common_regs *) (bar[DMA_BAR_INDEX] + 6 * TARGET_SPACING);
-	test_dma_read_bar();
 
 	return 0;
 }
@@ -276,25 +682,6 @@ static int set_dma_mask(struct pci_dev *pdev)
 	return rc;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
-static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
-{
-	pcie_capability_set_word(dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
-}
-#else
-static void __devinit enable_pcie_relaxed_ordering(struct pci_dev *dev)
-{
-	u16 v;
-	int pos;
-
-	pos = pci_pcie_cap(dev);
-	if (pos > 0) {
-		pci_read_config_word(dev, pos + PCI_EXP_DEVCTL, &v);
-		v |= PCI_EXP_DEVCTL_RELAX_EN;
-		pci_write_config_word(dev, pos + PCI_EXP_DEVCTL, v);
-	}
-}
-#endif
 static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int rc;
@@ -319,35 +706,10 @@ static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	map_bars(pdev);
 
 	set_dma_mask(pdev);
-	test_h2c(pdev);
+	//test_h2c(pdev);
 
-err_sgdma_cdev:
-err_interfaces:
-	dbg_init("xpcie_probe() err_interfaces\n");
-	//remove_engines(lro);
-err_engines:
-	dbg_init("xpcie_probe() err_engines\n");
-	//irq_teardown(lro);
-err_interrupts:
-err_mask:
-	dbg_init("xpcie_probe() err_mask\n");
-	//unmap_bars(lro, pdev);
-err_map:
-	dbg_init("xpcie_probe() err_map\n");
-	//if (lro->got_regions)
-	//	pci_release_regions(pdev);
 err_regions:
-	dbg_init("xpcie_probe() err_regions\n");
-	//if (lro->msi_enabled)
-	//	pci_disable_msi(pdev);
-err_scan_msi:
-	//if (!lro->regions_in_use)
-	//	pci_disable_device(pdev);*/
 err_enable:
-	//kfree(lro);
-err_alloc:
-end:
-
 	dbg_init("probe() returning %d\n", rc);
 	return rc;
 }
@@ -356,10 +718,6 @@ end:
 
 static void xpcie_remove(struct pci_dev *pdev)
 {
-	/* 这里有点问题，要搞个标志位，表示内存是否被映射过 */
-	int bar = 0;
-
-
 	dbg_io(DRV_NAME "call remove ");
 
 	unmap_bars(pdev);
@@ -378,8 +736,10 @@ static int xpcie_user_open(struct inode *inode, struct file *file)
 {
 	dbg_io(DRV_NAME "call open ");
 	return 0;
+
 }
-static int xpcie_user_read(struct file *filp, char __user *buff, size_t count, loff_t *offp)
+//ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);}
+static ssize_t xpcie_user_read(struct file *filp, char __user *buff, size_t count, loff_t *offp)
 {
 	return 0;
 }
@@ -466,14 +826,462 @@ static int  xpcie_h2c_open(struct inode *inode, struct file *file)
 	dbg_io(DRV_NAME "call xpcie_h2c_open ");
 	return 0;
 }
-static int  xpcie_h2c_read(struct file *filp, char __user *buff, size_t count, loff_t *offp)
+
+
+static ssize_t  xpcie_h2c_read(struct file *filp, char __user *buff, size_t count, loff_t *offp)
 {
-	return 0;
+
+	return count;
+}
+/* xdma_desc_alloc() - Allocate cache-coherent array of N descriptors.
+*
+* Allocates an array of 'number' descriptors in contiguous PCI bus addressable
+* memory. Chains the descriptors as a singly-linked list; the descriptor's
+* next * pointer specifies the bus address of the next descriptor.
+*
+*
+* @dev Pointer to pci_dev
+* @number Number of descriptors to be allocated
+* @desc_bus_p Pointer where to store the first descriptor bus address
+* @desc_last_p Pointer where to store the last descriptor virtual address,
+* or NULL.
+*
+* @return Virtual address of the first descriptor
+*
+*/
+static struct xdma_desc *xdma_desc_alloc(struct pci_dev *dev, int number,
+	dma_addr_t *desc_bus_p, struct xdma_desc **desc_last_p)
+{
+	struct xdma_desc *desc_virt;	/* virtual address */
+	dma_addr_t desc_bus;		/* bus address */
+	int i;
+	int adj = number - 1;
+	int extra_adj;
+	u32 temp_control;
+
+	BUG_ON(number < 1);
+
+	/* allocate a set of cache-coherent contiguous pages */
+	desc_virt = (struct xdma_desc *)pci_alloc_consistent(dev,
+		number * sizeof(struct xdma_desc), desc_bus_p);
+	if (!desc_virt)
+		return NULL;
+
+	dbg_sg("after pci_alloc_consistent\n");
+
+	/* get bus address of the first descriptor */
+	desc_bus = *desc_bus_p;
+
+	/* create singly-linked list for SG DMA controller */
+	for (i = 0; i < number - 1; i++) {
+		/* increment bus address to next in array */
+		desc_bus += sizeof(struct xdma_desc);
+
+		/* singly-linked list uses bus addresses */
+		desc_virt[i].next_lo = cpu_to_le32(PCI_DMA_L(desc_bus));
+		desc_virt[i].next_hi = cpu_to_le32(PCI_DMA_H(desc_bus));
+		desc_virt[i].bytes = cpu_to_le32(0);
+
+		/* any adjacent descriptors? */
+		if (adj > 0) {
+			extra_adj = adj - 1;
+			if (extra_adj > MAX_EXTRA_ADJ)
+				extra_adj = MAX_EXTRA_ADJ;
+
+			adj--;
+		}
+		else {
+			extra_adj = 0;
+		}
+
+		temp_control = DESC_MAGIC | (extra_adj << 8);
+
+
+		desc_virt[i].control = cpu_to_le32(temp_control);
+	}
+	/* { i = number - 1 } */
+	/* zero the last descriptor next pointer */
+	desc_virt[i].next_lo = cpu_to_le32(0);
+	desc_virt[i].next_hi = cpu_to_le32(0);
+	desc_virt[i].bytes = cpu_to_le32(0);
+
+	temp_control = DESC_MAGIC;
+
+
+	desc_virt[i].control = cpu_to_le32(temp_control);
+
+	/* caller wants a pointer to last descriptor? */
+	if (desc_last_p)
+		*desc_last_p = desc_virt + i;
+
+	/* return the virtual address of the first descriptor */
+	return desc_virt;
 }
 
+/* xdma_desc_free - Free cache-coherent linked list of N descriptors.
+*
+* @dev Pointer to pci_dev
+* @number Number of descriptors to be allocated
+* @desc_virt Pointer to (i.e. virtual address of) first descriptor in list
+* @desc_bus Bus address of first descriptor in list
+*/
+static void xdma_desc_free(struct pci_dev *dev, int number,
+	struct xdma_desc *desc_virt, dma_addr_t desc_bus)
+{
+	BUG_ON(!desc_virt);
+	BUG_ON(number < 0);
+	/* free contiguous list */
+	pci_free_consistent(dev, number * sizeof(struct xdma_desc), desc_virt,
+		desc_bus);
+}
+/* xdma_desc() - Fill a descriptor with the transfer details
+*
+* @desc pointer to descriptor to be filled
+* @addr root complex address
+* @ep_addr end point address
+* @len number of bytes, must be a (non-negative) multiple of 4.
+* @dir_to_dev If non-zero, source is root complex address and destination
+* is the end point address. If zero, vice versa.
+*
+* Does not modify the next pointer
+*/
+static void xdma_desc_set(struct xdma_desc *desc, dma_addr_t rc_bus_addr,
+	u64 ep_addr, int len, int dir_to_dev)
+{
+
+
+	/* transfer length */
+	desc->bytes = cpu_to_le32(len);
+	if (dir_to_dev) {
+		/* read from root complex memory (source address) */
+		desc->src_addr_lo = cpu_to_le32(PCI_DMA_L(rc_bus_addr));
+		desc->src_addr_hi = cpu_to_le32(PCI_DMA_H(rc_bus_addr));
+		/* write to end point address (destination address) */
+		desc->dst_addr_lo = cpu_to_le32(PCI_DMA_L(ep_addr));
+		desc->dst_addr_hi = cpu_to_le32(PCI_DMA_H(ep_addr));
+	}
+	else {
+		/* read from end point address (source address) */
+		desc->src_addr_lo = cpu_to_le32(PCI_DMA_L(ep_addr));
+		desc->src_addr_hi = cpu_to_le32(PCI_DMA_H(ep_addr));
+		/* write to root complex memory (destination address) */
+		desc->dst_addr_lo = cpu_to_le32(PCI_DMA_L(rc_bus_addr));
+		desc->dst_addr_hi = cpu_to_le32(PCI_DMA_H(rc_bus_addr));
+	}
+}
+
+
+static int transfer_build(struct xdma_transfer *transfer, u64 ep_addr,
+	int dir_to_dev, int non_incr_addr, int force_new_desc,
+	int userspace)
+{
+	int i = 0;
+	int j = 0;
+	int new_desc;
+	dma_addr_t cont_addr;
+	dma_addr_t addr;
+	unsigned int cont_len;
+	unsigned int len;
+	unsigned int cont_max_len = 0;
+	struct scatterlist *sgl;
+
+	
+
+	sgl = transfer->sgm->sgl;
+
+	/* start first contiguous block */
+	cont_addr = addr = sg_dma_address(&transfer->sgm->sgl[i]);
+	cont_len = 0;
+
+	/* iterate over all remaining entries but the last */
+	for (i = 0; i < transfer->sgl_nents - 1; i++) {
+		/* bus address of next entry i + 1 */
+		dma_addr_t next = sg_dma_address(&sgl[i + 1]);
+		/* length of this entry i */
+		len = sg_dma_len(&sgl[i]);
+		dbg_desc("SGLE %04d: addr=0x%016llx length=0x%08x\n", i,
+			(u64)addr, len);
+
+		/* add entry i to current contiguous block length */
+		cont_len += len;
+
+		new_desc = 0;
+
+		/* entry i + 1 is non-contiguous with entry i? CONTIGUOUS接触的，临近的 */
+		if (next != addr + len) {
+			dbg_desc("NON-CONTIGUOUS WITH DESC %d\n", i + 1);
+			new_desc = 1;
+		}
+		/* entry i reached maximum transfer size? */
+		else if (cont_len > (XDMA_DESC_MAX_BYTES - PAGE_SIZE)) {
+			dbg_desc("BREAK\n");
+			new_desc = 1;
+		}
+
+		if ((force_new_desc) && !(userspace))
+			new_desc = 1;
+
+		if (new_desc) {
+			/* fill in descriptor entry j with transfer details */
+			xdma_desc_set(transfer->desc_virt + j, cont_addr,
+				ep_addr, cont_len, dir_to_dev);
+
+
+			if (cont_len > cont_max_len)
+				cont_max_len = cont_len;
+
+			dbg_desc("DESC %4d:cont_addr=0x%llx\n", j,
+				(u64)cont_addr);
+			dbg_desc("DESC %4d:cont_len=0x%08x\n", j, cont_len);
+			dbg_desc("DESC %4d:ep_addr=0x%llx\n", j, (u64)ep_addr);
+			/* proceed EP address for next contiguous block */
+
+			/* for non-inc-add mode don't increment ep_addr */
+			if (userspace) {
+				if (non_incr_addr == 0)
+					ep_addr += cont_len;
+			}
+			else {
+				ep_addr += cont_len;
+			}
+
+			/* start new contiguous block */
+			cont_addr = next;
+			cont_len = 0;
+			j++;
+		}
+		/* goto entry i + 1 */
+		addr = next;
+	}
+	/* i is the last entry in the scatterlist, add it to the last block */
+	len = sg_dma_len(&sgl[i]);
+	cont_len += len;
+	BUG_ON(j > transfer->sgl_nents);
+
+	/* j is the index of the last descriptor */
+
+	dbg_desc("SGLE %4d: addr=0x%016llx length=0x%08x\n", i, (u64)addr, len);
+	dbg_desc("DESC %4d: cont_addr=0x%llx cont_len=0x%08x ep_addr=0x%llx\n",
+		j, (u64)cont_addr, cont_len, (unsigned long long)ep_addr);
+
+	/* XXX to test error condition, set cont_len = 0 */
+
+	/* fill in last descriptor entry j with transfer details */
+	xdma_desc_set(transfer->desc_virt + j, cont_addr, ep_addr, cont_len,
+		dir_to_dev);
+
+	return j;
+}
+
+
+/* xdma_desc_link() - Link two descriptors
+*
+* Link the first descriptor to a second descriptor, or terminate the first.
+*
+* @first first descriptor
+* @second second descriptor, or NULL if first descriptor must be set as last.
+* @second_bus bus address of second descriptor
+*/
+static void xdma_desc_link(struct xdma_desc *first, struct xdma_desc *second,
+	dma_addr_t second_bus)
+{
+	/*
+	* remember reserved control in first descriptor, but zero
+	* extra_adjacent!
+	*/
+	/* RTO - what's this about?  Shouldn't it be 0x0000c0ffUL? */
+	u32 control = le32_to_cpu(first->control) & 0x0000f0ffUL;
+	/* second descriptor given? */
+	if (second) {
+		/*
+		* link last descriptor of 1st array to first descriptor of
+		* 2nd array
+		*/
+		first->next_lo = cpu_to_le32(PCI_DMA_L(second_bus));
+		first->next_hi = cpu_to_le32(PCI_DMA_H(second_bus));
+		WARN_ON(first->next_hi);
+		/* no second descriptor given */
+	}
+	else {
+		/* first descriptor is the last */
+		first->next_lo = 0;
+		first->next_hi = 0;
+	}
+	/* merge magic, extra_adjacent and control field */
+	control |= DESC_MAGIC;
+
+	/* write bytes and next_num */
+	first->control = cpu_to_le32(control);
+}
+
+/* xdma_desc_control -- Set complete control field of a descriptor. */
+static void xdma_desc_control(struct xdma_desc *first, u32 control_field)
+{
+	/* remember magic and adjacent number */
+	u32 control = le32_to_cpu(first->control) & ~(LS_BYTE_MASK);
+
+	BUG_ON(control_field & ~(LS_BYTE_MASK));
+	/* merge adjacent and control field */
+	control |= control_field;
+	/* write control and next_adjacent */
+	first->control = cpu_to_le32(control);
+}
+static void transfer_terminate(struct xdma_transfer *transfer, int last)
+{
+	u32 control;
+
+	/* terminate last descriptor */
+	xdma_desc_link(transfer->desc_virt + last, 0, 0);
+	/* stop engine, EOP for AXI ST, req IRQ on last descriptor */
+	control = XDMA_DESC_STOPPED;
+	control |= XDMA_DESC_EOP;
+	control |= XDMA_DESC_COMPLETED;
+	xdma_desc_control(transfer->desc_virt + last, control);
+}
+
+/* xdma_desc_adjacent -- Set how many descriptors are adjacent to this one */
+static void xdma_desc_adjacent(struct xdma_desc *desc, int next_adjacent)
+{
+	int extra_adj = 0;
+	/* remember reserved and control bits */
+	u32 control = le32_to_cpu(desc->control) & 0x0000f0ffUL;
+	u32 max_adj_4k = 0;
+
+	if (next_adjacent > 0) {
+		extra_adj = next_adjacent - 1;
+		if (extra_adj > MAX_EXTRA_ADJ) {
+			extra_adj = MAX_EXTRA_ADJ;
+		}
+		max_adj_4k = (0x1000 - ((le32_to_cpu(desc->next_lo)) & 0xFFF)) / 32 - 1;
+		if (extra_adj > max_adj_4k) {
+			extra_adj = max_adj_4k;
+		}
+		if (extra_adj < 0) {
+			printk("Warning: extra_adj<0, converting it to 0\n");
+			extra_adj = 0;
+		}
+	}
+	/* merge adjacent and control field */
+	control |= 0xAD4B0000UL | (extra_adj << 8);
+	/* write control and next_adjacent */
+	desc->control = cpu_to_le32(control);
+}
+
+static void dump_desc(struct xdma_desc *desc_virt)
+{
+	int j;
+	u32 *p = (u32 *)desc_virt;
+	static char * const field_name[] = {
+		"magic|extra_adjacent|control", 
+		"bytes", 
+		"src_addr_lo",
+		"src_addr_hi", 
+		"dst_addr_lo", 
+		"dst_addr_hi", 
+		"next_addr",
+		"next_addr_pad" };
+	char *dummy;
+
+	/* remove warning about unused variable when debug printing is off */
+	dummy = field_name[0];
+
+	for (j = 0; j < 8; j += 1) {
+		dbg_desc("0x%08lx/0x%02lx: 0x%08x 0x%08x %s\n",
+			(uintptr_t)p, (uintptr_t)p & 15, (int)*p,
+			le32_to_cpu(*p), field_name[j]);
+		p++;
+	}
+	dbg_desc("\n");
+}
+static void transfer_dump(struct xdma_transfer *transfer)
+{
+	int i;
+	struct xdma_desc *desc_virt = transfer->desc_virt;
+
+	BUG_ON(!transfer->desc_num);
+	dbg_desc("Descriptor Entry (Pre-Transfer)\n");
+	for (i = 0; i < transfer->desc_num; i += 1)
+		dump_desc(desc_virt + i);
+}
 static ssize_t  xpcie_h2c_write(struct file *file, const char __user *buf, size_t count, loff_t * ppos)
 {
-	return 0;
+	int i;
+	int userspace = 1;
+	int force_new_desc = 0;
+	int non_incr_addr=0;
+	int last = 0; 
+	int rc;
+	unsigned long max_len = count;
+	int dir_to_dev = 1;
+	struct xdma_transfer transfer;
+	u64 ep_addr = (u64)(*ppos);
+
+
+	dbg_sg("xpcie_h2c_write\n");
+	memset(&transfer, 0, sizeof(transfer));
+
+	/* 为sgm分配空间 */
+	transfer.sgm = sg_create_mapper(max_len);
+
+	/* 获取用户空间的页, 存放在scatterlist中 */
+	rc = sgm_get_user_pages(transfer.sgm, buf, count, dir_to_dev);
+	dbg_sg("mapped_pages=%d.\n", transfer.sgm->mapped_pages);
+
+	dbg_sg("sgl = 0x%p.\n", transfer.sgm->sgl);
+	BUG_ON(!transfer.sgm->sgl);
+	BUG_ON(!transfer.sgm->mapped_pages);
+
+	/* map sgl */
+	transfer.sgl_nents = pci_map_sg(
+		xpcie_dev, transfer.sgm->sgl,
+		transfer.sgm->mapped_pages,
+		dir_to_dev ? DMA_TO_DEVICE : DMA_FROM_DEVICE 
+	);
+	dbg_sg("hwnents=%d.\n", transfer.sgl_nents);
+
+	/* 分配desc */
+	transfer.desc_virt = xdma_desc_alloc(xpcie_dev, transfer.sgl_nents, &transfer.desc_bus, NULL);
+	dbg_sg("transfer_create():\n");
+	dbg_sg("transfer->desc_bus = 0x%llx.\n", transfer.desc_bus);
+
+
+
+	/* 填写desc a.建立链表 */
+	last = transfer_build(&transfer, ep_addr, dir_to_dev, non_incr_addr,
+		force_new_desc, userspace);
+
+
+	/* 填写desc b.终止链表 */
+	transfer_terminate(&transfer, last);
+
+	/* 填写desc c.设置adjcent */
+	last++;
+	transfer.desc_adjacent = last;
+	transfer.desc_num = last;
+	dbg_sg("transfer 0x%p has %d descriptors\n", &transfer, transfer.desc_num);
+	for (i = 0; i < transfer.desc_num; i++) {
+		xdma_desc_adjacent(transfer.desc_virt + i,
+			transfer.desc_num - i - 1);
+	}
+
+	/* 打印desc */
+	transfer_dump(&transfer);
+
+	/*  开始传输  */
+	transfer_start(xpcie_dev, &transfer);
+
+
+
+	/* 取消DMA流映射 */
+	pci_unmap_sg(xpcie_dev, transfer.sgm->sgl,
+		transfer.sgm->mapped_pages,
+		dir_to_dev ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+
+	/* 释放用户页 */
+	sgm_put_user_pages(transfer.sgm, dir_to_dev);
+
+ 	sg_destroy_mapper(transfer.sgm);
+	return count;
 }
 
 
@@ -560,12 +1368,11 @@ static struct file_operations xpcie_c2h_fops = {
 static int __init xpcie_init(void)
 {
 	int rc = 0;
-	int i;
 	dbg_init("begin  init\n");
 
 	/* 注册 pcie 驱动*/
 	rc = pci_register_driver(&xpcie_driver);
-	if (IS_ERR(rc)) {
+	if (rc != 0) {
 		dbg_init(DRV_NAME ": failed to pci_register_driver");
 		rc = -1;
 		goto err_class;

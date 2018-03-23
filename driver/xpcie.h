@@ -24,11 +24,17 @@
 #include <linux/uio.h>
 
 
+#include <linux/pagemap.h>
+#include <linux/scatterlist.h>
+
 
 #define DRV_NAME "xpcie"
 #define DRV_NAME_USER DRV_NAME "_user"
 #define DRV_NAME_H2C DRV_NAME "_h2c"
 #define DRV_NAME_C2H DRV_NAME "_c2h"
+#define MAX_EXTRA_ADJ (15)
+#define LS_BYTE_MASK 0x000000FFUL
+
 
 #ifndef VM_RESERVED
 #define VMEM_FLAGS (VM_IO | VM_DONTEXPAND | VM_DONTDUMP)
@@ -84,6 +90,8 @@ struct config_regs {
 	u32 reserved_1[4];
 	u32 msi_enable;
 };
+
+
 
 /**
 * SG DMA Controller status and control registers
@@ -309,3 +317,46 @@ struct xdma_poll_wb {
 	u32 completed_desc_count;
 	u32 reserved_1[7];
 } __packed;
+
+
+
+/* describes a mapping from a virtual memory user buffer to scatterlist */
+struct sg_mapping_t {
+	/* scatter gather list used to map in the relevant user pages */
+	struct scatterlist *sgl;
+	/* pointer to array of page pointers */
+	struct page **pages;
+	/* maximum amount of pages in the scatterlist and page array */
+	int max_pages;
+	/* current amount of mapped pages in the scatterlist and page array */
+	int mapped_pages;
+};
+
+/* Describes a (SG DMA) single transfer for the engine */
+struct xdma_transfer {
+	struct list_head entry;		/* queue of non-completed transfers */
+	struct xdma_desc *desc_virt;	/* virt addr of the 1st descriptor */
+	dma_addr_t desc_bus;		/* bus addr of the first descriptor */
+	int desc_adjacent;		/* adjacent descriptors at desc_bus */
+	int desc_num;			/* number of descriptors in transfer */
+	int dir_to_dev;			/* specify transfer direction */
+	wait_queue_head_t wq;		/* wait queue for transfer completion */
+	struct kiocb *iocb;		/* completion buffer for async I/O */
+	int sgl_nents;			/* adjacent descriptors at desc_virt */
+	struct sg_mapping_t *sgm;	/* user space scatter-gather mapper */
+	int userspace;			/* flag if user space pages are got */
+	//enum transfer_state state;	/* state of the transfer */
+	int cyclic;			/* flag if transfer is cyclic */
+	int last_in_request;		/* flag if last within request */
+	ssize_t size_of_request;	/* request size */
+};
+struct sg_mapping_t *sg_create_mapper(unsigned long max_len);
+void sg_destroy_mapper(struct sg_mapping_t *sgm);
+
+int sgm_get_user_pages(struct sg_mapping_t *sgm, const char *start, size_t count, int to_user);
+int sgm_put_user_pages(struct sg_mapping_t *sgm, int dirtied);
+void sgm_dirty_pages(struct sg_mapping_t *sgm);
+
+int sgm_kernel_pages(struct sg_mapping_t *sgm, const char *start, size_t count, int to_user);
+
+
