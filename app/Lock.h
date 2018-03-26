@@ -1,6 +1,4 @@
 
-
-
 #ifndef LOCK_H_
 #define LOCK_H_
 
