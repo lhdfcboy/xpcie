@@ -46,6 +46,7 @@ static int user_minor = 1;
 static int h2c_minor = 2;
 static int c2h_minor = 3;
 static struct pci_dev *xpcie_dev;
+static int irq_line;		/* flag if irq allocated successfully */
 
 static const struct pci_device_id pci_ids[] = {
 	{ PCI_DEVICE(0x10ee, 0x7024), },
@@ -682,6 +683,65 @@ static int set_dma_mask(struct pci_dev *pdev)
 	return rc;
 }
 
+static int probe_scan_for_msi(struct pci_dev *pdev)
+{
+	int i;
+	int rc = 0;
+
+	BUG_ON(!pdev);
+	
+	if (pci_find_capability(pdev, PCI_CAP_ID_MSI)) {
+		/* enable message signalled interrupts */
+		dbg_init("pci_enable_msi()\n");
+		rc = pci_enable_msi(pdev);
+		if (rc < 0)
+			dbg_init("Couldn't enable MSI mode: rc = %d\n", rc);
+	}
+	else {
+		dbg_init("MSI/MSI-X not detected - using legacy interrupts\n");
+	}
+
+	return rc;
+}
+/*
+* xdma_isr() - Interrupt handler
+*
+* @dev_id pointer to xdma_dev
+*/
+static irqreturn_t xdma_isr(int irq, void *dev_id)
+{
+
+}
+static int irq_setup(struct pci_dev *pdev)
+{
+	int rc = 0;
+	u32 irq_flag;
+	u8 val;
+	void *reg;
+	u32 w;
+
+	BUG_ON(!pdev);
+
+	//irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
+	irq_flag = 0;
+	irq_line = (int)pdev->irq;  /*中断号是自动分配的*/
+	rc = request_irq(pdev->irq, xdma_isr, irq_flag, DRV_NAME, NULL);
+	if (rc)
+		dbg_init("Couldn't use IRQ#%d, rc=%d\n", pdev->irq, rc);
+	else
+		dbg_init("Using IRQ#%d with 0x%p\n", pdev->irq);
+	
+	return rc;
+}
+static void irq_teardown()
+{
+	int i;
+
+	if (irq_line != -1) {
+		dbg_init("Releasing IRQ#%d\n", irq_line);
+		free_irq(irq_line, NULL);
+	}
+}
 static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int rc;
@@ -699,6 +759,10 @@ static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dbg_init("pci_set_master()\n");
 	pci_set_master(pdev);
 
+	/* enable MSI interrupt */
+	probe_scan_for_msi(pdev);
+
+
 	rc = request_regions(pdev);
 	if (rc)
 		goto err_regions;
@@ -707,6 +771,8 @@ static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	set_dma_mask(pdev);
 	//test_h2c(pdev);
+
+	irq_setup(pdev);
 
 err_regions:
 err_enable:
@@ -719,6 +785,7 @@ err_enable:
 static void xpcie_remove(struct pci_dev *pdev)
 {
 	dbg_io(DRV_NAME "call remove ");
+	irq_teardown();
 
 	unmap_bars(pdev);
 	pci_release_regions(pdev);
