@@ -435,7 +435,32 @@ static void channel_interrupts_enable(u32 mask)
 	write_register(mask, &reg->channel_int_enable_w1s);
 }
 
-
+/* channel_interrupts_enable -- Enable interrupts we are interested in */
+static void h2c_interrupts_enable(void)
+{
+	u32 reg_value=0;
+	
+	reg_value = XDMA_CTRL_IE_DESC_ALIGN_MISMATCH;
+	reg_value |= XDMA_CTRL_IE_MAGIC_STOPPED;
+	reg_value |= XDMA_CTRL_IE_MAGIC_STOPPED;
+	reg_value |= XDMA_CTRL_IE_READ_ERROR;
+	reg_value |= XDMA_CTRL_IE_DESC_ERROR;
+
+	reg_value |= XDMA_CTRL_IE_DESC_STOPPED;
+	reg_value |= XDMA_CTRL_IE_DESC_COMPLETED;
+	
+	write_register(reg_value, &engine_regs_h2c->interrupt_enable_mask);
+	/* dummy read of status register to flush all previous writes */
+	read_register(&engine_regs_h2c->interrupt_enable_mask);
+}
+static void h2c_interrupts_disable(void)
+{
+	u32 reg_value = 0;
+
+	write_register(reg_value, &engine_regs_h2c->interrupt_enable_mask);
+	/* dummy read of status register to flush all previous writes */
+	read_register(&engine_regs_h2c->interrupt_enable_mask);
+}
 /* channel_interrupts_disable -- Disable interrupts we not interested in */
 static void channel_interrupts_disable(u32 mask)
 {
@@ -670,8 +695,8 @@ static int transfer_start(struct pci_dev *pdev,
 	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);
 
 	//模拟中断触发
-	mdelay(2000);
-	h2c_irq->events_irq = 1;
+// 	mdelay(2000);
+// 	h2c_irq->events_irq = 1;
 
 	/* 
 	 *	W.1 sleep until any interrupt events have occurred, or a signal arrived	
@@ -694,7 +719,6 @@ static int transfer_start(struct pci_dev *pdev,
 
 	/* 等待传输完成后 */
 #if 0
-	mdelay(2000);
 	value = read_register(&engine_regs_h2c->status);
 	dbg_init("engine_regs_h2c->status =  0x%08X\n", value);
 #endif
@@ -943,9 +967,13 @@ static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	/* 申请中断资源 */
 	irq_setup(pdev);
 
-	/* 开启中断 */
+	/* 中断控制器使能h2c0 */
 	irq_mask = 0x01;
 	channel_interrupts_enable(irq_mask);
+
+	/* h2c0 引擎开启各个中断类型 */
+	h2c_interrupts_enable();
+
 
 	/* Flush writes */
 	read_interrupts();
@@ -962,6 +990,7 @@ static void xpcie_remove(struct pci_dev *pdev)
 {
 	dbg_io(DRV_NAME "call remove ");
 
+	h2c_interrupts_disable();
 	channel_interrupts_disable(~0);
 	read_interrupts();
 	irq_teardown();
