@@ -13,6 +13,7 @@
 #include <asm-generic/iomap.h>
 
 
+
 #include <linux/cdev.h>
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
@@ -641,6 +642,7 @@ static int transfer_start(struct pci_dev *pdev,
 	unsigned long flags;
 	u32 irq_mask;
 
+	
 	BUG_ON(!pdev);
 	BUG_ON(!transfer);
 	BUG_ON(!h2c_irq);
@@ -656,24 +658,21 @@ static int transfer_start(struct pci_dev *pdev,
 	}
 	dbg_init("iowrite32(0x%08x to engine_sgdma_regs->first_desc_adjacent ) (first_desc_adjacent)\n", extra_adj);
 	write_register(cpu_to_le32(extra_adj), &engine_sgdma_regs->first_desc_adjacent);
-	
+	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);
 	/* 设置sgdma_regs */
 	dbg_init("transfer->desc_bus =  0x%016llX\n", transfer->desc_bus);
 	dbg_init("transfer->desc_adjacent =  0x%08X\n", transfer->desc_adjacent);
 	write_register(cpu_to_le32(PCI_DMA_L(transfer->desc_bus)), &engine_sgdma_regs->first_desc_lo);
 	write_register(cpu_to_le32(PCI_DMA_H(transfer->desc_bus)), &engine_sgdma_regs->first_desc_hi);
-
+	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);
 	/* 启动引擎 */
 	engine_start();
+	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);
 
-	/* 等待传输完 */
-#if 0
+	//模拟中断触发
 	mdelay(2000);
-	value = read_register(&engine_regs_h2c->status);
-	dbg_init("engine_regs_h2c->status =  0x%08X\n", value);
-#endif
+	h2c_irq->events_irq = 1;
 
-	
 	/* 
 	 *	W.1 sleep until any interrupt events have occurred, or a signal arrived	
 	 *  正常返回0， 被打断返回 -ERESTARTSYS
@@ -681,16 +680,25 @@ static int transfer_start(struct pci_dev *pdev,
 	rc = wait_event_interruptible(h2c_irq->events_wq,
 		h2c_irq->events_irq != 0);
 	if (rc)
-		dbg_sg("wait_event_interruptible=%d\n", rc);
-
+	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);	dbg_sg("wait_event_interruptible=%d\n", rc);
+	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);
 	/* W.2 清除标志 */
 	spin_lock_irqsave(&h2c_irq->events_lock, flags);
 	h2c_irq->events_irq = 0;
 	spin_unlock_irqrestore(&h2c_irq->events_lock, flags);
-
+	dbg_init("oops function=%s, line=%d\n", __FUNCTION__, __LINE__);
 	/* W.3 开中断 */
 	irq_mask = 0x01 ;
 	channel_interrupts_enable(irq_mask);
+
+
+	/* 等待传输完成后 */
+#if 0
+	mdelay(2000);
+	value = read_register(&engine_regs_h2c->status);
+	dbg_init("engine_regs_h2c->status =  0x%08X\n", value);
+#endif
+
 
 	/* 停止引擎 */
 	engine_stop();
@@ -748,7 +756,6 @@ static int set_dma_mask(struct pci_dev *pdev)
 
 static int probe_scan_for_msi(struct pci_dev *pdev)
 {
-	int i;
 	int rc = 0;
 
 	BUG_ON(!pdev);
@@ -787,12 +794,8 @@ static void h2c_irq_service(struct xdma_irq *h2c_irq)
 static irqreturn_t xdma_isr(int irq, void *dev_id)
 {
 	u32 ch_irq;
-	u32 user_irq;
 	struct xdma_dev *lro;
 	struct interrupt_regs *irq_regs;
-	int user_irq_bit;
-	struct xdma_engine *engine;
-	int channel;
 
 	dbg_irq("(irq=%d) <<<< INTERRUPT SERVICE ROUTINE\n", irq);
 	//BUG_ON(!dev_id);
@@ -854,9 +857,6 @@ static int irq_setup(struct pci_dev *pdev)
 {
 	int rc = 0;
 	u32 irq_flag;
-	u8 val;
-	void *reg;
-	u32 w;
 
 	BUG_ON(!pdev);
 
@@ -867,13 +867,12 @@ static int irq_setup(struct pci_dev *pdev)
 	if (rc)
 		dbg_init("Couldn't use IRQ#%d, rc=%d\n", pdev->irq, rc);
 	else
-		dbg_init("Using IRQ#%d with 0x%p\n", pdev->irq);
+		dbg_init("Using IRQ#%d \n", pdev->irq);
 	
 	return rc;
 }
-static void irq_teardown()
+static void irq_teardown(void)
 {
-	int i;
 
 	if (irq_line != -1) {
 		dbg_init("Releasing IRQ#%d\n", irq_line);
@@ -883,7 +882,7 @@ static void irq_teardown()
 
 
 /* read_interrupts -- Print the interrupt controller status */
-static u32 read_interrupts()
+static u32 read_interrupts(void)
 {
 	struct interrupt_regs *reg = (struct interrupt_regs *)
 		(bar[config_bar_idx] + XDMA_OFS_INT_CTRL);
@@ -901,12 +900,17 @@ static u32 read_interrupts()
 	/* return interrupts: user in upper 16-bits, channel in lower 16-bits */
 	return build_u32(hi, lo);
 }
-
+static void h2c_irq_init(struct xdma_irq* h2c_irq)
+{
+	spin_lock_init(&h2c_irq->events_lock);
+	init_waitqueue_head(&h2c_irq->events_wq);
+	return;
+}
 static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int rc;
-	xpcie_dev = pdev;
 	int irq_mask;
+	xpcie_dev = pdev;
 
 	rc = pci_enable_device(pdev);
 	if (rc) {
@@ -933,6 +937,9 @@ static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	set_dma_mask(pdev);
 	//test_h2c(pdev);
 
+	/* 初始化h2c_irq */
+	h2c_irq_init(&h2c_irq);
+
 	/* 申请中断资源 */
 	irq_setup(pdev);
 
@@ -954,10 +961,14 @@ err_enable:
 static void xpcie_remove(struct pci_dev *pdev)
 {
 	dbg_io(DRV_NAME "call remove ");
+
+	channel_interrupts_disable(~0);
+	read_interrupts();
 	irq_teardown();
 
 	unmap_bars(pdev);
 	pci_release_regions(pdev);
+	pci_disable_msi(pdev);
 	pci_disable_device(pdev);
 	return;
 }
