@@ -359,4 +359,8 @@ void sgm_dirty_pages(struct sg_mapping_t *sgm);
 
 int sgm_kernel_pages(struct sg_mapping_t *sgm, const char *start, size_t count, int to_user);
 
-
+struct xdma_irq {
+	u8 events_irq;			/* accumulated IRQs */
+	spinlock_t events_lock;		/* lock to safely update events_irq */
+	wait_queue_head_t events_wq;	/* wait queue to sync waiting threads */
+};

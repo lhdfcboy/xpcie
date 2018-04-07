@@ -47,7 +47,7 @@ static int h2c_minor = 2;
 static int c2h_minor = 3;
 static struct pci_dev *xpcie_dev;
 static int irq_line;		/* flag if irq allocated successfully */
-
+static struct xdma_irq h2c_irq;
 static const struct pci_device_id pci_ids[] = {
 	{ PCI_DEVICE(0x10ee, 0x7024), },
 	{ PCI_DEVICE(0x10ee, 0x7038), },
@@ -403,18 +403,47 @@ err:
 }
 
 
-inline void write_register(u32 value, void *iomem)
+static inline void write_register(u32 value, void *iomem)
 {
 	iowrite32(value, iomem);
 }
 
-inline u32 read_register(void *iomem)
+static inline u32 read_register(void *iomem)
 {
 	return ioread32(iomem);
+}
+static inline u32 build_u32(u32 hi, u32 lo)
+{
+	return ((hi & 0xFFFFUL) << 16) | (lo & 0xFFFFUL);
+}
+static inline u64 build_u64(u64 hi, u64 lo)
+{
+	return ((hi & 0xFFFFFFFULL) << 32) | (lo & 0xFFFFFFFFULL);
 }
 
 #define XDMA_BAR_NUM 2
 static void *__iomem bar[XDMA_BAR_NUM];	/* addresses for mapped BARs */
+const static int config_bar_idx = 1;
+
+/* channel_interrupts_enable -- Enable interrupts we are interested in */
+static void channel_interrupts_enable(u32 mask)
+{
+	struct interrupt_regs *reg = (struct interrupt_regs *)
+		(bar[config_bar_idx] + XDMA_OFS_INT_CTRL);
+
+	write_register(mask, &reg->channel_int_enable_w1s);
+}
+
+
+/* channel_interrupts_disable -- Disable interrupts we not interested in */
+static void channel_interrupts_disable(u32 mask)
+{
+	struct interrupt_regs *reg = (struct interrupt_regs *)
+		(bar[config_bar_idx] + XDMA_OFS_INT_CTRL);
+
+	write_register(mask, &reg->channel_int_enable_w1c);
+}
+
 static int map_single_bar(struct pci_dev *dev, int idx)
 {
 	resource_size_t bar_start;
@@ -537,6 +566,10 @@ static int test_h2c(struct pci_dev *pdev)
 	u64 ep_addr = 0;
 	u32 temp_control = 0;
 	int i;
+
+	BUG_ON(!pdev);
+
+
 	/* 分配desc */
 	desc_size = sizeof(struct xdma_desc);
 	desc_virt = pci_alloc_consistent(pdev, desc_size, &desc_bus);
@@ -585,6 +618,9 @@ static int test_h2c(struct pci_dev *pdev)
 	value = read_register(&engine_regs_h2c->status);
 	dbg_init("engine_regs_h2c->status =  0x%08X\n", value);
 
+	
+
+
 	/* 停止引擎 */
 	engine_stop();
 
@@ -594,11 +630,20 @@ out2:
 out1:
 	return 0;
 }
-
-static int transfer_start(struct pci_dev *pdev, struct xdma_transfer* transfer)
+static int transfer_start(struct pci_dev *pdev, 
+							struct xdma_transfer* transfer,
+							struct xdma_irq* h2c_irq
+	)
 {
 	u32 value;
 	int extra_adj = 0;
+	int rc = 0;
+	unsigned long flags;
+	u32 irq_mask;
+
+	BUG_ON(!pdev);
+	BUG_ON(!transfer);
+	BUG_ON(!h2c_irq);
 
 	value = read_register(&engine_regs_h2c->status);
 	dbg_init("before transfer, engine_regs_h2c->status =  0x%08X\n", value);
@@ -617,22 +662,40 @@ static int transfer_start(struct pci_dev *pdev, struct xdma_transfer* transfer)
 	dbg_init("transfer->desc_adjacent =  0x%08X\n", transfer->desc_adjacent);
 	write_register(cpu_to_le32(PCI_DMA_L(transfer->desc_bus)), &engine_sgdma_regs->first_desc_lo);
 	write_register(cpu_to_le32(PCI_DMA_H(transfer->desc_bus)), &engine_sgdma_regs->first_desc_hi);
-	
-
 
 	/* 启动引擎 */
 	engine_start();
 
 	/* 等待传输完 */
+#if 0
 	mdelay(2000);
 	value = read_register(&engine_regs_h2c->status);
 	dbg_init("engine_regs_h2c->status =  0x%08X\n", value);
+#endif
+
+	
+	/* 
+	 *	W.1 sleep until any interrupt events have occurred, or a signal arrived	
+	 *  正常返回0， 被打断返回 -ERESTARTSYS
+	 */
+	rc = wait_event_interruptible(h2c_irq->events_wq,
+		h2c_irq->events_irq != 0);
+	if (rc)
+		dbg_sg("wait_event_interruptible=%d\n", rc);
+
+	/* W.2 清除标志 */
+	spin_lock_irqsave(&h2c_irq->events_lock, flags);
+	h2c_irq->events_irq = 0;
+	spin_unlock_irqrestore(&h2c_irq->events_lock, flags);
+
+	/* W.3 开中断 */
+	irq_mask = 0x01 ;
+	channel_interrupts_enable(irq_mask);
 
 	/* 停止引擎 */
 	engine_stop();
 
-
-	return 0;
+	return rc;
 }
 
 static int map_bars(struct pci_dev *pdev)
@@ -703,6 +766,19 @@ static int probe_scan_for_msi(struct pci_dev *pdev)
 
 	return rc;
 }
+/* 唤醒进程，仿照user_irq_service 函数*/
+static void h2c_irq_service(struct xdma_irq *h2c_irq)
+{
+	unsigned long flags;
+
+	BUG_ON(!h2c_irq);
+	spin_lock_irqsave(&(h2c_irq->events_lock), flags);
+	if (!h2c_irq->events_irq) {
+		h2c_irq->events_irq = 1;
+		wake_up_interruptible(&(h2c_irq->events_wq));
+	}
+	spin_unlock_irqrestore(&(h2c_irq->events_lock), flags);
+}
 /*
 * xdma_isr() - Interrupt handler
 *
@@ -710,7 +786,69 @@ static int probe_scan_for_msi(struct pci_dev *pdev)
 */
 static irqreturn_t xdma_isr(int irq, void *dev_id)
 {
+	u32 ch_irq;
+	u32 user_irq;
+	struct xdma_dev *lro;
+	struct interrupt_regs *irq_regs;
+	int user_irq_bit;
+	struct xdma_engine *engine;
+	int channel;
 
+	dbg_irq("(irq=%d) <<<< INTERRUPT SERVICE ROUTINE\n", irq);
+	//BUG_ON(!dev_id);
+	
+	lro = (struct xdma_dev *)dev_id;
+
+
+	irq_regs = (struct interrupt_regs *)(bar[config_bar_idx] + XDMA_OFS_INT_CTRL);
+
+	/* read channel interrupt requests 
+	 * This register (channel_int_request) ,
+	 * reflects the interrupt source AND with the enable mask register
+	 */
+	ch_irq = read_register(&irq_regs->channel_int_request);
+	dbg_irq("ch_irq = 0x%08x\n", ch_irq);
+
+	/*
+	* disable all interrupts that fired; these are re-enabled individually
+	* after the causing module has been fully serviced.
+	*/
+	channel_interrupts_disable(ch_irq);
+
+	h2c_irq_service(&h2c_irq);
+
+#if 0
+	/* read user interrupts - this read also flushes the above write */
+	user_irq = read_register(&irq_regs->user_int_request);
+	dbg_irq("user_irq = 0x%08x\n", user_irq);
+
+	for (user_irq_bit = 0; user_irq_bit < MAX_USER_IRQ; user_irq_bit++) {
+		if (user_irq & (1 << user_irq_bit))
+			user_irq_service(&lro->user_irq[user_irq_bit]);
+	}
+
+
+	/* iterate over H2C (PCIe read) */
+	for (channel = 0; channel < XDMA_CHANNEL_NUM_MAX; channel++) {
+		engine = lro->engine[channel][0];
+		/* engine present and its interrupt fired? */
+		if (engine && (engine->irq_bitmask & ch_irq)) {
+			dbg_tfr("schedule_work(engine=%p)\n", engine);
+			schedule_work(&engine->work);
+		}
+	}
+
+	/* iterate over C2H (PCIe write) */
+	for (channel = 0; channel < XDMA_CHANNEL_NUM_MAX; channel++) {
+		engine = lro->engine[channel][1];
+		/* engine present and its interrupt fired? */
+		if (engine && (engine->irq_bitmask & ch_irq)) {
+			dbg_tfr("schedule_work(engine=%p)\n", engine);
+			schedule_work(&engine->work);
+		}
+	}
+#endif
+	return IRQ_HANDLED;
 }
 static int irq_setup(struct pci_dev *pdev)
 {
@@ -742,10 +880,33 @@ static void irq_teardown()
 		free_irq(irq_line, NULL);
 	}
 }
+
+
+/* read_interrupts -- Print the interrupt controller status */
+static u32 read_interrupts()
+{
+	struct interrupt_regs *reg = (struct interrupt_regs *)
+		(bar[config_bar_idx] + XDMA_OFS_INT_CTRL);
+	u32 lo;
+	u32 hi;
+
+	/* extra debugging; inspect complete engine set of registers */
+	hi = read_register(&reg->user_int_request);
+	dbg_io("ioread32(0x%p) returned 0x%08x (user_int_request).\n",
+		&reg->user_int_request, hi);
+	lo = read_register(&reg->channel_int_request);
+	dbg_io("ioread32(0x%p) returned 0x%08x (channel_int_request)\n",
+		&reg->channel_int_request, lo);
+
+	/* return interrupts: user in upper 16-bits, channel in lower 16-bits */
+	return build_u32(hi, lo);
+}
+
 static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	int rc;
 	xpcie_dev = pdev;
+	int irq_mask;
 
 	rc = pci_enable_device(pdev);
 	if (rc) {
@@ -772,7 +933,15 @@ static int xpcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	set_dma_mask(pdev);
 	//test_h2c(pdev);
 
+	/* 申请中断资源 */
 	irq_setup(pdev);
+
+	/* 开启中断 */
+	irq_mask = 0x01;
+	channel_interrupts_enable(irq_mask);
+
+	/* Flush writes */
+	read_interrupts();
 
 err_regions:
 err_enable:
@@ -1335,8 +1504,11 @@ static ssize_t  xpcie_h2c_write(struct file *file, const char __user *buf, size_
 	transfer_dump(&transfer);
 
 	/*  开始传输  */
-	transfer_start(xpcie_dev, &transfer);
-
+	rc = transfer_start(xpcie_dev, &transfer, &h2c_irq);
+	if (rc == 0)
+	{
+		rc = count;
+	}
 
 
 	/* 取消DMA流映射 */
@@ -1348,7 +1520,8 @@ static ssize_t  xpcie_h2c_write(struct file *file, const char __user *buf, size_
 	sgm_put_user_pages(transfer.sgm, dir_to_dev);
 
  	sg_destroy_mapper(transfer.sgm);
-	return count;
+
+	return rc;
 }
 
 
